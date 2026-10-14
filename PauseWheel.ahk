@@ -1,7 +1,7 @@
 ; PauseWheel.ahk — AHK v2
 ; Wheel press (Volume_Mute, VK=0xAD) is swallowed on the keyboard hook and replayed
 ; as play/pause straight to the Spotify window only. System master volume is never
-; touched, other media apps are never touched. 500ms debounce: autorepeat swallowed.
+; touched, other media apps are never touched. 100ms debounce: autorepeat swallowed.
 ; Tray-only app (no console window, no taskbar button). All logging is OFF by
 ; default — enable with `PauseWheel.exe --log` or tray menu (Logging: OFF -> ON).
 ; Fallback: if a master-mute arrives via another path (HID/AppCommand), it is rolled
@@ -275,8 +275,8 @@ OnMuteKey(ThisHotkey) {
     global HijackSpotify, lastBlockToggle
     OnKeyPress(ThisHotkey) ; same PRESSED log line as other keys
     now := A_TickCount
-    if (now - lastBlockToggle < 500) {
-        Log("Volume_Mute repeat swallowed (debounce 500ms)")
+    if (now - lastBlockToggle < 100) {
+        Log("Volume_Mute repeat swallowed (debounce 100ms)")
         return
     }
     lastBlockToggle := now
