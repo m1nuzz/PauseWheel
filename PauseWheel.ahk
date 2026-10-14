@@ -12,7 +12,7 @@ Persistent(true)
 InstallKeybdHook()
 InstallMouseHook()
 SetTitleMatchMode(2)
-A_IconTip := "PauseWheel — wheel = Spotify play/pause"
+A_IconTip := "PauseWheel"
 if FileExist(A_ScriptDir . "\headphones.ico") {
     try TraySetIcon(A_ScriptDir . "\headphones.ico")
 }
