@@ -6,20 +6,32 @@ Wheel press (multimedia `Volume_Mute`, VK `0xAD`) → **play/pause Spotify only*
   volume is never touched and other media apps are never touched.
 - The press is replayed as `WM_APPCOMMAND / APPCOMMAND_MEDIA_PLAY_PAUSE`
   posted straight to the Spotify window.
-- 500 ms debounce: key autorepeat from a held wheel is swallowed.
+- 100 ms debounce: key autorepeat from a held wheel is swallowed.
 - Tray-only app: no console window, no taskbar button.
 - Fallback: if a master-mute arrives via another path (HID-consumer, AppCommand),
   it is rolled back and the Spotify audio-session mute is toggled instead
   (tray: `Spotify-hijack ON|OFF`).
 - Logging is **OFF by default** (see below).
 
+## Download
+
+Get the latest build here: [latest release](../../releases/latest)
+(`PauseWheel.exe` = 64-bit, `PauseWheel_x32.exe` = 32-bit).
+The link always points to the newest release — no version number hardcoded.
+
+## Install (autostart)
+
+1. Download `PauseWheel.exe` from the [latest release](../../releases/latest).
+2. Press `Win+R`, paste `shell:startup`, press Enter — the Startup folder opens.
+3. Drop `PauseWheel.exe` itself (or a shortcut to it) into that folder.
+
+Done — Windows will launch it on every logon, tray-only.
+
 ## Run
 
 Double-click `PauseWheel.exe` (64-bit) or `PauseWheel_x32.exe` (32-bit).
 Lives in the tray. Tray menu: Show/Hide console, Open log, Spotify-hijack
 ON|OFF, Logging ON|OFF, Exit.
-
-Optional: put a shortcut into `shell:startup` to launch on Windows logon.
 
 ## Logging (off by default)
 
