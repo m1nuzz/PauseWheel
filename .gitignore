@@ -1,0 +1,3 @@
+# Build outputs and runtime logs are not committed.
+*.exe
+*_log.txt
