@@ -56,8 +56,7 @@ EnsureLogFile() {
         return true
     try FileDelete(LogFile)
     try {
-        f := FileOpen(LogFile, "w", "UTF-8")
-        f.Write(Chr(0xFEFF)) ; BOM so Cyrillic reads correctly in notepad/powershell
+        f := FileOpen(LogFile, "w", "UTF-8") ; "w" already emits one BOM
         f.Close()
     } catch {
         return false
@@ -99,7 +98,6 @@ global evtCbVtbl := "", evtCbObj := "", evtCbAddr := 0
 global notifVtbl := "", notifObj := "", notifObjAddr := 0
 global evtCallbacks := []
 global evtGuidBuf := Buffer(16, 0)
-global UiMuteGuids := [] ; mouse-UI context GUIDs to skip (filled after GUID capture run)
 
 ; --- Selftest: PauseWheel.exe --selftest ---
 if (A_Args.Length > 0) {
@@ -374,24 +372,32 @@ ReregisterMuteNotify() {
 
 OnMuteEvent(wParam, lParam, msg, hwnd) {
     Critical
-    global HijackSpotify, evtGuidBuf, UiMuteGuids
+    global HijackSpotify, evtGuidBuf
     muted := wParam
     guid := GuidToStr(evtGuidBuf)
     Log("MUTE-EVENT muted=" . muted . " ctx=" . guid)
     if (!muted)
         return ; unmuted transitions (including our own rollback) are ignored
-    for g in UiMuteGuids {
-        if (StrLower(guid) = StrLower(g)) {
-            Log("UI mute (mouse click) — left alone, master stays muted")
-            return
-        }
+    if (guid != "00000000-0000-0000-0000-000000000000") {
+        ; Non-NULL context = click from system UI (tray flyout/mixer), not the wheel.
+        ; Leave master alone. NULL ctx = HID/wheel path -> hijack below.
+        Log("UI mute (mouse click, ctx tagged) — left alone, master stays muted")
+        return
     }
     if (!HijackSpotify) {
         Log("SYSTEM MUTE → MUTED (event path)")
         return
     }
     res := HijackMasterMuteToSpotify()
-    Log(res)
+    if (StrLen(res) < 10) {
+        ; Corruption trap: dump char codes so the next occurrence identifies itself
+        codes := ""
+        Loop StrLen(res)
+            codes .= Format("{:04X} ", Ord(SubStr(res, A_Index, 1)))
+        Log("HIJACK-RESULT-GARBLED len=" . StrLen(res) . " codes=" . codes)
+    } else {
+        Log(res)
+    }
 }
 
 OnDeviceEvent(wParam, lParam, msg, hwnd) {
