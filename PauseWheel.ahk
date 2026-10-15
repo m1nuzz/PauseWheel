@@ -5,8 +5,10 @@
 ; Tray-only app (no console window, no taskbar button). One hook only: the
 ; blocking $*vkAD (wheel). Nothing else is listened to. All logging is OFF by
 ; default — enable with `PauseWheel.exe --log` or tray menu (Logging: OFF -> ON).
-; Fallback: if a master-mute arrives via another path (HID/AppCommand), it is rolled
+; Fallback: if a master-mute arrives via another path (HID consumer key, vendor
+; driver), the event-driven IAudioEndpointVolumeCallback catches it, it is rolled
 ; back and the Spotify session mute is toggled instead (Spotify-hijack ON|OFF).
+; Zero polling — no timers anywhere.
 
 #Requires AutoHotkey v2.0
 #SingleInstance Force
@@ -38,7 +40,7 @@ console := ""
 ; or via tray menu (Logging: OFF -> ON). When off, nothing is written anywhere.
 global LogEnabled := false
 global LogFile := A_ScriptDir . "\pausewheel_log.txt"
-global fileLog := ""
+global LogStarted := false
 for _arg in A_Args {
     if (_arg = "--log" || _arg = "/log") {
         LogEnabled := true
@@ -47,14 +49,20 @@ for _arg in A_Args {
 }
 
 EnsureLogFile() {
-    global LogFile, fileLog
-    if (IsObject(fileLog))
+    ; One-shot: recreate the file with BOM. Every Log() line is appended
+    ; with FileAppend (open-write-close), so lines are always flushed to disk.
+    global LogFile, LogStarted
+    if (LogStarted)
         return true
     try FileDelete(LogFile)
-    try fileLog := FileOpen(LogFile, "w", "UTF-8")
-    if (!IsObject(fileLog))
+    try {
+        f := FileOpen(LogFile, "w", "UTF-8")
+        f.Write(Chr(0xFEFF)) ; BOM so Cyrillic reads correctly in notepad/powershell
+        f.Close()
+    } catch {
         return false
-    try fileLog.Write(Chr(0xFEFF)) ; BOM so Cyrillic reads correctly in notepad/powershell
+    }
+    LogStarted := true
     return true
 }
 
@@ -67,14 +75,31 @@ Log(msg) {
         if (IsObject(console))
             console.WriteLine(line)
     }
-    try {
-        if (EnsureLogFile()) {
-            fileLog.WriteLine(line)
+    if (EnsureLogFile()) {
+        ; Duplicate to stdout for terminal launches (FileAppend "*" works if a parent console exists)
+        try FileAppend(line . "`n", "*", "UTF-8")
+        catch {
+        }
+        try FileAppend(line . "`n", LogFile, "UTF-8")
+        catch {
         }
     }
-    ; Duplicate to stdout for terminal launches (FileAppend "*" works if a parent console exists)
-    try FileAppend(line . "`n", "*", "UTF-8")
 }
+
+; --- Event path globals (must execute before --selftest, which runs top-to-bottom) ---
+WM_MUTE_EVENT := 0x8001 ; WM_APP+1
+WM_DEVICE_EVENT := 0x8002 ; WM_APP+2
+CLSID_MMDeviceEnumerator := "{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+; NOTE: SDK documents ...636BEE6, but on this machine only ...63617E6 QIs
+; successfully (empirically verified; thqby's Audio.ahk uses the same).
+IID_IMMDeviceEnumerator := "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
+IID_IAudioEndpointVolume := "{5CDF2C82-841E-4546-9722-0CF74078229A}"
+global evtEnum := "", evtVol := ""
+global evtCbVtbl := "", evtCbObj := "", evtCbAddr := 0
+global notifVtbl := "", notifObj := "", notifObjAddr := 0
+global evtCallbacks := []
+global evtGuidBuf := Buffer(16, 0)
+global UiMuteGuids := [] ; mouse-UI context GUIDs to skip (filled after GUID capture run)
 
 ; --- Selftest: PauseWheel.exe --selftest ---
 if (A_Args.Length > 0) {
@@ -104,11 +129,17 @@ if (A_Args.Length > 0) {
             } catch as e {
                 Log("SELFTEST FAIL: SoundGetMute threw: " . e.Message)
             }
+            ; Check event-driven mute notify chain (enumerator -> default device -> endpoint volume)
+            try {
+                RegisterMuteNotify()
+                UnregisterEndpointVolume()
+                Log("SELFTEST OK: event mute-notify chain registers")
+            } catch as e {
+                Log("SELFTEST FAIL: event chain: " . e.Message)
+            }
             try {
                 if (IsObject(console))
                     console.Close()
-                if (IsObject(fileLog))
-                    fileLog.Close()
             }
             ExitApp(0)
         }
@@ -142,13 +173,11 @@ OpenLog(*) {
 }
 
 TrayExit(*) {
-    global console, fileLog
+    global console
     Log("Exit via tray.")
     try {
         if (IsObject(console))
             console.Close()
-        if (IsObject(fileLog))
-            fileLog.Close()
     }
     ExitApp(0)
 }
@@ -196,30 +225,204 @@ lastBlockToggle := 0
 
 Log(Format("Hotkeys registered: {1} (wheel only).", Registered))
 
-; --- Effect path: poll the system mute state. Fires even when the event itself is invisible. ---
-; If Spotify-hijack is on, a master-mute is rolled back and the Spotify session is toggled instead.
-lastMute := ""
-try lastMute := SoundGetMute()
-SetTimer(PollMute, 100)
+; --- Event path: IAudioEndpointVolume::RegisterControlChangeNotify. Zero polling. ---
+; Master-mute arrivals invoke CbMuteNotify on an audio-service thread; the handler
+; copies bMuted + guidEventContext and PostMessages WM_APP+1 to the main thread.
+; IMMNotificationClient re-registers after default-device switches (WM_APP+2).
+; (Constants/globals live above --selftest; they must execute before it does.)
 
-PollMute() {
-    global lastMute, HijackSpotify
-    m := ""
-    try m := SoundGetMute()
-    catch {
-        return
+; COM callbacks below run on foreign (audio-service RPC) threads: body is
+; NumGet/NumPut + async PostMessageW only. No COM, no alloc, no I/O, no Fast mode.
+CbQI(this, iid, pobj) {
+    NumPut("Ptr", this, pobj, 0)
+    return 0
+}
+CbAddRef(this) {
+    return 1
+}
+CbRelease(this) {
+    return 1
+}
+CbMuteNotify(this, pNotify) {
+    global evtGuidBuf
+    muted := NumGet(pNotify, 16, "Int")
+    Loop 4
+        NumPut("UInt", NumGet(pNotify, (A_Index - 1) * 4, "UInt"), evtGuidBuf, (A_Index - 1) * 4)
+    DllCall("User32\PostMessageW", "Ptr", A_ScriptHwnd, "UInt", 0x8001, "Ptr", muted, "Ptr", 0)
+    return 0
+}
+NotifStateChanged(this, devId, state) {
+    return 0
+}
+NotifAdded(this, devId) {
+    return 0
+}
+NotifRemoved(this, devId) {
+    return 0
+}
+NotifDefaultChanged(this, flow, role, devId) {
+    if (flow = 0) ; eRender only
+        DllCall("User32\PostMessageW", "Ptr", A_ScriptHwnd, "UInt", 0x8002, "Ptr", role, "Ptr", 0)
+    return 0
+}
+NotifPropChanged(this, devId, key) {
+    return 0
+}
+
+GuidToStr(buf) {
+    return Format("{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        NumGet(buf, 0, "UInt"), NumGet(buf, 4, "UShort"), NumGet(buf, 6, "UShort"),
+        NumGet(buf, 8, "UChar"), NumGet(buf, 9, "UChar"), NumGet(buf, 10, "UChar"),
+        NumGet(buf, 11, "UChar"), NumGet(buf, 12, "UChar"), NumGet(buf, 13, "UChar"),
+        NumGet(buf, 14, "UChar"), NumGet(buf, 15, "UChar"))
+}
+
+GetDeviceEnumerator() {
+    global CLSID_MMDeviceEnumerator, IID_IMMDeviceEnumerator
+    try
+        return ComObject(CLSID_MMDeviceEnumerator, IID_IMMDeviceEnumerator)
+    catch as e {
+        Log("Enumerator ComObject failed (" . e.Message . "), manual CoCreateInstance")
     }
-    if (m == lastMute)
-        return
-    lastMute := m
-    if (!m)
+    clsidBuf := Buffer(16, 0)
+    iidBuf := Buffer(16, 0)
+    DllCall("Ole32\CLSIDFromString", "WStr", CLSID_MMDeviceEnumerator, "Ptr", clsidBuf)
+    DllCall("Ole32\CLSIDFromString", "WStr", IID_IMMDeviceEnumerator, "Ptr", iidBuf)
+    pEnum := 0
+    hr := DllCall("Ole32\CoCreateInstance", "Ptr", clsidBuf.Ptr, "Ptr", 0, "UInt", 0x17, "Ptr", iidBuf.Ptr, "Ptr*", &pEnum)
+    if (hr != 0 || !pEnum)
+        throw Error("CoCreateInstance failed, HRESULT=" . hr)
+    return ComValue(13, pEnum)
+}
+
+RegisterEndpointVolume() {
+    global evtEnum, evtVol, evtCbVtbl, evtCbObj, evtCbAddr, evtCallbacks, IID_IAudioEndpointVolume
+    pDev := 0
+    ComCall(4, evtEnum, "Int", 0, "Int", 0, "Ptr*", &pDev) ; GetDefaultAudioEndpoint(eRender, eConsole)
+    if (!pDev)
+        throw Error("no default render device")
+    dev := ComValue(13, pDev)
+    iidBuf := Buffer(16, 0)
+    DllCall("Ole32\CLSIDFromString", "WStr", IID_IAudioEndpointVolume, "Ptr", iidBuf)
+    pVol := 0
+    ComCall(3, dev, "Ptr", iidBuf.Ptr, "UInt", 0x17, "Ptr", 0, "Ptr*", &pVol) ; IMMDevice.Activate
+    if (!pVol)
+        throw Error("Activate IAudioEndpointVolume failed")
+    evtVol := ComValue(13, pVol)
+    if (!evtCbAddr) {
+        evtCbVtbl := Buffer(4 * A_PtrSize, 0)
+        vcb := [CallbackCreate(CbQI, , 3), CallbackCreate(CbAddRef, , 1), CallbackCreate(CbRelease, , 1), CallbackCreate(CbMuteNotify, , 2)]
+        for a in vcb
+            evtCallbacks.Push(a)
+        Loop 4
+            NumPut("Ptr", vcb[A_Index], evtCbVtbl, (A_Index - 1) * A_PtrSize)
+        evtCbObj := Buffer(2 * A_PtrSize, 0)
+        NumPut("Ptr", evtCbVtbl.Ptr, "Ptr", 0, evtCbObj, 0)
+        evtCbAddr := evtCbObj.Ptr
+    }
+    ComCall(3, evtVol, "Ptr", evtCbAddr) ; RegisterControlChangeNotify
+}
+
+UnregisterEndpointVolume() {
+    global evtVol, evtCbAddr
+    if (IsObject(evtVol) && evtCbAddr) {
+        try ComCall(4, evtVol, "Ptr", evtCbAddr) ; UnregisterControlChangeNotify
+        catch as e {
+            Log("UnregisterEndpointVolume: " . e.Message)
+        }
+    }
+    evtVol := ""
+}
+
+RegisterMuteNotify() {
+    global evtEnum, notifVtbl, notifObj, notifObjAddr, evtCallbacks
+    OnMessage(0x8001, OnMuteEvent)
+    OnMessage(0x8002, OnDeviceEvent)
+    evtEnum := GetDeviceEnumerator()
+    ; Notification client first: recovery path if the endpoint reg fails.
+    notifVtbl := Buffer(8 * A_PtrSize, 0)
+    ncb := [CallbackCreate(CbQI, , 3), CallbackCreate(CbAddRef, , 1), CallbackCreate(CbRelease, , 1),
+        CallbackCreate(NotifStateChanged, , 3), CallbackCreate(NotifAdded, , 2),
+        CallbackCreate(NotifRemoved, , 2), CallbackCreate(NotifDefaultChanged, , 4),
+        CallbackCreate(NotifPropChanged, , 3)]
+    for a in ncb
+        evtCallbacks.Push(a)
+    Loop 8
+        NumPut("Ptr", ncb[A_Index], notifVtbl, (A_Index - 1) * A_PtrSize)
+    notifObj := Buffer(2 * A_PtrSize, 0)
+    NumPut("Ptr", notifVtbl.Ptr, "Ptr", 0, notifObj, 0)
+    notifObjAddr := notifObj.Ptr
+    ComCall(6, evtEnum, "Ptr", notifObjAddr) ; RegisterEndpointNotificationCallback
+    RegisterEndpointVolume()
+    OnExit(MuteNotifyExit)
+    return true
+}
+
+ReregisterMuteNotify() {
+    Log("Default device changed — re-registering mute notify")
+    try UnregisterEndpointVolume()
+    catch as e {
+        Log("Reregister: unregister failed: " . e.Message)
+    }
+    try {
+        RegisterEndpointVolume()
+        Log("Mute notify re-registered OK")
+    } catch as e {
+        Log("Reregister FAILED: " . e.Message . " (will retry on next device event)")
+    }
+}
+
+OnMuteEvent(wParam, lParam, msg, hwnd) {
+    Critical
+    global HijackSpotify, evtGuidBuf, UiMuteGuids
+    muted := wParam
+    guid := GuidToStr(evtGuidBuf)
+    Log("MUTE-EVENT muted=" . muted . " ctx=" . guid)
+    if (!muted)
         return ; unmuted transitions (including our own rollback) are ignored
+    for g in UiMuteGuids {
+        if (StrLower(guid) = StrLower(g)) {
+            Log("UI mute (mouse click) — left alone, master stays muted")
+            return
+        }
+    }
     if (!HijackSpotify) {
-        Log("SYSTEM MUTE STATE CHANGED → MUTED (event came as HID/AppCommand, not VK)")
+        Log("SYSTEM MUTE → MUTED (event path)")
         return
     }
     res := HijackMasterMuteToSpotify()
     Log(res)
+}
+
+OnDeviceEvent(wParam, lParam, msg, hwnd) {
+    Critical
+    ReregisterMuteNotify()
+}
+
+MuteNotifyExit(exitReason, exitCode) {
+    global evtEnum, evtVol, evtCbAddr, notifObjAddr, evtCallbacks
+    if (IsObject(evtVol) && evtCbAddr) {
+        try ComCall(4, evtVol, "Ptr", evtCbAddr)
+        catch {
+        }
+    }
+    if (IsObject(evtEnum) && notifObjAddr) {
+        try ComCall(7, evtEnum, "Ptr", notifObjAddr)
+        catch {
+        }
+    }
+    for a in evtCallbacks {
+        try CallbackFree(a)
+        catch {
+        }
+    }
+}
+
+try {
+    RegisterMuteNotify()
+    Log("Event mute-notify registered (zero polling)")
+} catch as e {
+    Log("Event mute-notify FAILED: " . e.Message . " (wheel-block path still works)")
 }
 
 ; Proven recipe (SessProbe3/HijackTest): SoundGetInterface for IASM2 on default +
@@ -297,15 +500,13 @@ CollectSpotifySavs() {
     Loop 32 {
         try
             mgr := SoundGetInterface(IASM2, "", String(A_Index))
-        catch as e {
-            Log("CollectSpotifySavs: device " . A_Index . " skipped: " . e.Message)
+        catch {
             continue ; dead/unplugged endpoint (0x88890008) — keep scanning rest
         }
         if (!mgr)
             continue
         try ScanSpotifySessions(mgr, savs)
-        catch as e {
-            Log("CollectSpotifySavs: device " . A_Index . " scan failed: " . e.Message)
+        catch {
         }
     }
     return savs
