@@ -8,8 +8,22 @@
 ; Fallback: if a master-mute arrives via another path (HID/AppCommand), it is rolled
 ; back and the Spotify session mute is toggled instead (Spotify-hijack ON|OFF).
 
+#Requires AutoHotkey v2.0
 #SingleInstance Force
 Persistent(true)
+
+; Last-resort net (Module_Errors TIER 5): uncaught exceptions go to the log
+; file instead of a popup. Registered before any throwable code.
+OnError(GlobalCrashHandler)
+GlobalCrashHandler(err, mode) {
+    try {
+        f := FileOpen(A_ScriptDir . "\pausewheel_log.txt", "a", "UTF-8")
+        f.WriteLine(Format("[{1}] CRASH [{2}] {3} @ {4}:{5}", FormatTime(, "HH:mm:ss"), Type(err), err.Message, err.File, err.Line))
+        f.Close()
+    }
+    return 1 ; suppress the default AHK crash dialog
+}
+
 InstallKeybdHook()
 SetTitleMatchMode(2)
 A_IconTip := "PauseWheel"
@@ -56,7 +70,6 @@ Log(msg) {
     try {
         if (EnsureLogFile()) {
             fileLog.WriteLine(line)
-            fileLog.Read(0) ; no-op, keep handle alive
         }
     }
     ; Duplicate to stdout for terminal launches (FileAppend "*" works if a parent console exists)
@@ -121,6 +134,7 @@ A_TrayMenu.Add(hijackLabel, ToggleHijack)
 A_TrayMenu.Add(logLabel, ToggleLogging)
 A_TrayMenu.Add()
 A_TrayMenu.Add("Exit", TrayExit)
+A_TrayMenu.Default := "Open pausewheel_log.txt" ; double-click opens the log
 
 OpenLog(*) {
     global LogFile
@@ -218,7 +232,8 @@ ScanSpotifySessions(mgr, savs) {
     pen := 0
     try
         ComCall(5, mgr, "Ptr*", &pen := 0)
-    catch {
+    catch as e {
+        Log("ScanSpotifySessions: GetSessionEnumerator failed: " . e.Message)
         return
     }
     if (!pen)
@@ -227,14 +242,16 @@ ScanSpotifySessions(mgr, savs) {
     count := 0
     try
         ComCall(3, sessEnum, "UInt*", &count := 0)
-    catch {
+    catch as e {
+        Log("ScanSpotifySessions: GetCount failed: " . e.Message)
         return
     }
     Loop count {
         ps := 0
         try
             ComCall(4, sessEnum, "Int", A_Index - 1, "Ptr*", &ps := 0)
-        catch {
+        catch as e {
+            Log("ScanSpotifySessions: GetSession failed: " . e.Message)
             continue
         }
         if (!ps)
@@ -243,7 +260,8 @@ ScanSpotifySessions(mgr, savs) {
         st := 0
         try
             ComCall(3, sess, "UInt*", &st := 0)
-        catch {
+        catch as e {
+            Log("ScanSpotifySessions: GetState failed: " . e.Message)
             continue
         }
         if (st > 1) ; 0=ACTIVE, 1=INACTIVE ok (paused Spotify), skip EXPIRED(2)
@@ -251,7 +269,8 @@ ScanSpotifySessions(mgr, savs) {
         pb := 0
         try
             ComCall(12, sess, "Ptr*", &pb := 0)
-        catch {
+        catch as e {
+            Log("ScanSpotifySessions: GetSessionIdentifier failed: " . e.Message)
             continue
         }
         sid := pb ? StrGet(pb, "UTF-16") : ""
@@ -260,7 +279,8 @@ ScanSpotifySessions(mgr, savs) {
         if (!InStr(StrLower(sid), "spotify.exe"))
             continue
         try sav := ComObjQuery(sess, ISAV)
-        catch {
+        catch as e {
+            Log("ScanSpotifySessions: ISimpleAudioVolume QI failed: " . e.Message)
             continue
         }
         savs.Push(sav)
@@ -271,18 +291,21 @@ CollectSpotifySavs() {
     savs := []
     IASM2 := "{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}"
     try ScanSpotifySessions(SoundGetInterface(IASM2), savs)
-    catch {
+    catch as e {
+        Log("CollectSpotifySavs: default device failed: " . e.Message)
     }
     Loop 32 {
         try
             mgr := SoundGetInterface(IASM2, "", String(A_Index))
-        catch {
+        catch as e {
+            Log("CollectSpotifySavs: device " . A_Index . " skipped: " . e.Message)
             continue ; dead/unplugged endpoint (0x88890008) — keep scanning rest
         }
         if (!mgr)
             continue
         try ScanSpotifySessions(mgr, savs)
-        catch {
+        catch as e {
+            Log("CollectSpotifySavs: device " . A_Index . " scan failed: " . e.Message)
         }
     }
     return savs
@@ -290,13 +313,28 @@ CollectSpotifySavs() {
 
 ; Play/pause ONLY Spotify: WM_APPCOMMAND/PLAY_PAUSE posted straight to its
 ; window. Master volume untouched, other media apps untouched.
+WM_APPCOMMAND_MSG := 0x319
+APPCOMMAND_PLAY_PAUSE := 0xE0000 ; APPCOMMAND_MEDIA_PLAY_PAUSE (14) << 16
 ToggleSpotifyPlayback() {
+    global WM_APPCOMMAND_MSG, APPCOMMAND_PLAY_PAUSE
     try {
-        PostMessage(0x319, 0, 0xE0000, , "ahk_exe Spotify.exe") ; APPCOMMAND_MEDIA_PLAY_PAUSE = 14 << 16
+        PostMessage(WM_APPCOMMAND_MSG, 0, APPCOMMAND_PLAY_PAUSE, , "ahk_exe Spotify.exe")
         return "Wheel-block: play/pause sent to Spotify only, master untouched"
     } catch as e {
         return "Wheel-block: Spotify window not found (" . e.Message . "), session-mute fallback: " . ToggleSpotifyDirect()
     }
+}
+
+; Shared mute-flip: read current Spotify session mute, apply the opposite to
+; every collected session. Returns 1 if Spotify is now MUTED, 0 if UNMUTED.
+FlipSpotifyMute(savs) {
+    cur := 0
+    ComCall(6, savs[1], "Int*", &cur := 0)
+    target := cur ? 0 : 1
+    for sav in savs {
+        try ComCall(5, sav, "Int", target, "Ptr", 0)
+    }
+    return target
 }
 
 ; Direct Spotify toggle for the blocking OnMuteKey path: master is never
@@ -306,12 +344,7 @@ ToggleSpotifyDirect() {
     if (savs.Length = 0)
         return "Wheel-block: key swallowed, but Spotify has no audio session (not playing?). Nothing muted."
     try {
-        cur := 0
-        ComCall(6, savs[1], "Int*", &cur := 0)
-        target := cur ? 0 : 1
-        for sav in savs {
-            try ComCall(5, sav, "Int", target, "Ptr", 0)
-        }
+        target := FlipSpotifyMute(savs)
         return "Wheel-block: system master untouched → Spotify " . (target ? "MUTED" : "UNMUTED")
     } catch as e {
         return "Wheel-block apply failed: " . e.Message
@@ -323,12 +356,7 @@ HijackMasterMuteToSpotify() {
     if (savs.Length = 0)
         return "SYSTEM MUTE → MUTED. Hijack skipped: Spotify has no audio session (not playing?). Master left muted."
     try {
-        cur := 0
-        ComCall(6, savs[1], "Int*", &cur := 0)
-        target := cur ? 0 : 1
-        for sav in savs {
-            try ComCall(5, sav, "Int", target, "Ptr", 0)
-        }
+        target := FlipSpotifyMute(savs)
         try SoundSetMute(false) ; roll back the system-wide mute
         return "Wheel-hijack: system master restored → Spotify " . (target ? "MUTED" : "UNMUTED")
     } catch as e {
